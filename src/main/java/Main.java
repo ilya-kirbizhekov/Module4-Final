@@ -1,10 +1,17 @@
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.javarush.dao.CityDAO;
 import com.javarush.dao.CountryDAO;
 import com.javarush.domain.City;
 import com.javarush.domain.Country;
 import com.javarush.domain.CountryLanguage;
+import com.javarush.redis.CityCountry;
+import com.javarush.redis.Language;
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.RedisURI;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.sync.RedisStringCommands;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.cfg.Configuration;
@@ -13,18 +20,36 @@ import org.hibernate.cfg.Environment;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 public class Main {
 
     private final SessionFactory sessionFactory;
-    //private final ObjectMapper mapper; it's optional i'm not going to use it
+    private final ObjectMapper mapper;
     private final CityDAO cityDAO;
     private final CountryDAO countryDAO;
+
+    private final RedisClient redisClient;
 
     public Main() {
         sessionFactory = prepareRelationalDb();
         cityDAO = new CityDAO(sessionFactory);
         countryDAO = new CountryDAO(sessionFactory);
+
+        redisClient = prepareRedisClient();
+        mapper = new ObjectMapper();
+
+    }
+
+    private RedisClient prepareRedisClient() {
+
+        RedisClient redisClient = RedisClient.create(RedisURI.create("localhost", 6379));
+        try (StatefulRedisConnection<String, String> connection = redisClient.connect()) {
+            System.out.println("\nConnected to Redis\n");
+        }
+        return redisClient;
+
     }
 
     private SessionFactory prepareRelationalDb() {
@@ -71,8 +96,57 @@ public class Main {
 
         Main main = new Main();
         List<City> allCities = main.fetchData(main);
+        List<CityCountry> preparedData = main.transformData(allCities);
+        main.pushToRedis(preparedData);
         main.shutdown();
 
+
+    }
+
+    private void pushToRedis(List<CityCountry> preparedData) {
+
+        try (StatefulRedisConnection<String, String> connection = redisClient.connect()) {
+            RedisStringCommands<String, String> sync = connection.sync();
+            for (CityCountry cityCountry : preparedData) {
+                try {
+                    sync.set(String.valueOf(cityCountry.getId()), mapper.writeValueAsString(cityCountry));
+                } catch (JsonProcessingException e) {
+                    e.printStackTrace();
+                }
+            }
+
+        }
+    }
+
+    private List<CityCountry> transformData(List<City> cities) {
+
+        return cities.stream().map(city -> {
+            CityCountry res = new CityCountry();
+            res.setId(city.getId());
+            res.setName(city.getName());
+            res.setPopulation(city.getPopulation());
+            res.setDistrict(city.getDistrict());
+
+            Country country = city.getCountry();
+            res.setAlternativeCountryCode(country.getAlternativeCode());
+            res.setContinent(country.getContinent());
+            res.setCountryCode(country.getCode());
+            res.setCountryName(country.getName());
+            res.setCountryPopulation(country.getPopulation());
+            res.setCountryRegion(country.getRegion());
+            res.setCountrySurfaceArea(country.getSurfaceArea());
+            Set<CountryLanguage> countryLanguages = country.getLanguages();
+            Set<Language> languages = countryLanguages.stream().map(cl -> {
+                Language language = new Language();
+                language.setLanguage(cl.getLanguage());
+                language.setOfficial(cl.getOfficial());
+                language.setPercentage(cl.getPercentage());
+                return language;
+            }).collect(Collectors.toSet());
+            res.setLanguages(languages);
+
+            return res;
+        }).collect(Collectors.toList());
 
     }
 
@@ -80,6 +154,32 @@ public class Main {
 
         //it's optional i'm not going to use it
 
+    }
+
+
+    private void testRedisData(List<Integer> ids) {
+        try (StatefulRedisConnection<String, String> connection = redisClient.connect()) {
+            RedisStringCommands<String, String> sync = connection.sync();
+            for (Integer id : ids) {
+                String value = sync.get(String.valueOf(id));
+                try {
+                    mapper.readValue(value, CityCountry.class);
+                } catch (JsonProcessingException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+    private void testMysqlData(List<Integer> ids) {
+        try (Session session = sessionFactory.getCurrentSession()) {
+            session.beginTransaction();
+            for (Integer id : ids) {
+                City city = cityDAO.getById(id);
+                Set<CountryLanguage> languages = city.getCountry().getLanguages();
+            }
+            session.getTransaction().commit();
+        }
     }
 
 }
